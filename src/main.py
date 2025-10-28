@@ -20,8 +20,6 @@ from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
-from webdriver_manager.core.os_manager import ChromeType
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
@@ -154,7 +152,9 @@ def scrape_google_trends(url: str, category_name: str, category_id: int, downloa
     chrome_options.add_experimental_option("prefs", prefs)
 
     try:
-        service = ChromeService(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install())
+        # Use system ChromeDriver (installed in Docker) instead of webdriver-manager
+        # This fixes the "Exec format error" bug in Railway deployment
+        service = ChromeService(executable_path='/usr/bin/chromedriver')
         driver = webdriver.Chrome(service=service, options=chrome_options)
         
         driver.execute_cdp_cmd("Page.setDownloadBehavior", {
@@ -164,15 +164,29 @@ def scrape_google_trends(url: str, category_name: str, category_id: int, downloa
 
         existing_files = set(os.listdir(download_dir))
         driver.get(url)
+        logger.info(f"Navigated to {url}")
 
-        wait = WebDriverWait(driver, 20)
-        time.sleep(3)
+        wait = WebDriverWait(driver, 30)
+        time.sleep(5)  # Increased wait for page load
         
-        export_btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'Export')]")))
-        export_btn.click()
+        logger.info(f"Page title: {driver.title}")
+        
+        # Try to find Export button with better error handling
+        try:
+            export_btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'Export')]")))
+            logger.info("Export button found")
+            export_btn.click()
+        except Exception as e:
+            logger.error(f"Export button not found: {e}")
+            # Save page source for debugging
+            page_source = driver.page_source
+            logger.error(f"Page source length: {len(page_source)}")
+            logger.error(f"Page preview: {page_source[:500]}")
+            raise
 
-        time.sleep(2)
+        time.sleep(3)  # Increased wait
         csv_element = driver.find_element(By.XPATH, "//span[contains(text(), 'Download CSV')]")
+        logger.info("CSV option found")
         
         if csv_element:
             try:
