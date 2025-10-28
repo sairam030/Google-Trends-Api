@@ -143,6 +143,11 @@ def scrape_google_trends(url: str, category_name: str, category_id: int, downloa
     chrome_options.add_argument("--remote-debugging-port=9222")
     chrome_options.add_argument("--window-size=1920,1080")
     chrome_options.add_argument("--disable-software-rasterizer")
+    
+    # Set Chrome binary location
+    chrome_bin = os.environ.get('CHROME_BIN', '/usr/bin/chromium')
+    if os.path.exists(chrome_bin):
+        chrome_options.binary_location = chrome_bin
 
     prefs = {
         "download.default_directory": os.path.abspath(download_dir),
@@ -154,7 +159,18 @@ def scrape_google_trends(url: str, category_name: str, category_id: int, downloa
     try:
         # Use system ChromeDriver (installed in Docker) instead of webdriver-manager
         # This fixes the "Exec format error" bug in Railway deployment
-        service = ChromeService(executable_path='/usr/bin/chromedriver')
+        chromedriver_path = os.environ.get('CHROMEDRIVER_PATH', '/usr/bin/chromedriver')
+        
+        # Verify chromedriver exists
+        if not os.path.exists(chromedriver_path):
+            logger.error(f"ChromeDriver not found at {chromedriver_path}")
+            # Try alternative path
+            chromedriver_path = '/usr/bin/chromium-driver'
+            if not os.path.exists(chromedriver_path):
+                raise Exception(f"ChromeDriver not found at {chromedriver_path}")
+        
+        logger.info(f"Using ChromeDriver at: {chromedriver_path}")
+        service = ChromeService(executable_path=chromedriver_path)
         driver = webdriver.Chrome(service=service, options=chrome_options)
         
         driver.execute_cdp_cmd("Page.setDownloadBehavior", {
@@ -274,12 +290,32 @@ async def root():
 @app.get("/health")
 async def health_check():
     """Health check endpoint for monitoring"""
-    return {
+    health_data = {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
         "cache_size": len(cache),
         "uptime": "operational"
     }
+    
+    # Check ChromeDriver availability
+    chromedriver_path = os.environ.get('CHROMEDRIVER_PATH', '/usr/bin/chromedriver')
+    chromedriver_exists = os.path.exists(chromedriver_path)
+    
+    if not chromedriver_exists:
+        # Try alternative path
+        chromedriver_path = '/usr/bin/chromium-driver'
+        chromedriver_exists = os.path.exists(chromedriver_path)
+    
+    health_data["chromedriver"] = {
+        "available": chromedriver_exists,
+        "path": chromedriver_path if chromedriver_exists else "not found"
+    }
+    
+    if not chromedriver_exists:
+        health_data["status"] = "degraded"
+        health_data["warning"] = "ChromeDriver not found - scraping will fail"
+    
+    return health_data
 
 
 @app.get("/categories")

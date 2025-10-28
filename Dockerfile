@@ -30,6 +30,8 @@ RUN apt-get update && apt-get install -y \
 # Set environment variables for Chrome
 ENV CHROME_BIN=/usr/bin/chromium
 ENV CHROMEDRIVER_PATH=/usr/bin/chromedriver
+# Disable webdriver-manager auto-download
+ENV WDM_LOCAL=1
 
 # Set working directory
 WORKDIR /app
@@ -43,6 +45,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application
 COPY src/ ./src/
 COPY config/ ./config/
+COPY start.sh .
+RUN chmod +x start.sh
 
 # Create temp directory
 RUN mkdir -p temp_downloads
@@ -51,4 +55,4 @@ RUN mkdir -p temp_downloads
 EXPOSE 8000
 
 # Run application
-CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["./start.sh"]
