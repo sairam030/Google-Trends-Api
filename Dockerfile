@@ -49,7 +49,10 @@ COPY start.sh .
 RUN chmod +x start.sh
 
 # Create temp directory
-RUN mkdir -p temp_downloads
+RUN mkdir -p temp_downloads cache_data
+
+# Set permissions
+RUN chmod 755 temp_downloads cache_data
 
 # Expose port
 EXPOSE 8000

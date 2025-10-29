@@ -1,7 +1,11 @@
 """
-Google Trends API - Production Ready
-Version: 1.0.0
-Clean RESTful endpoints with proper error handling and logging
+Google Trends API - with Background Data Fetching
+Version: 2.0.0
+Features:
+- Background data fetching every 30 minutes
+- Instant API responses from pre-fetched cache
+- Persistent storage across restarts
+- Auto-refresh mechanism
 """
 
 from fastapi import FastAPI, HTTPException, Request, status
@@ -14,6 +18,8 @@ import os
 import time
 import csv
 import logging
+import json
+from pathlib import Path
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service as ChromeService
@@ -22,6 +28,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 
 # Configure logging
 logging.basicConfig(
@@ -30,11 +38,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Storage configuration
+CACHE_DIR = Path("cache_data")
+CACHE_DIR.mkdir(exist_ok=True)
+
 # Initialize FastAPI
 app = FastAPI(
     title="Google Trends API",
-    description="Production-ready API for real-time Google Trends data",
-    version="1.0.0",
+    description="Production-ready API for real-time Google Trends data with background fetching",
+    version="2.0.0",
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -44,14 +56,26 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Configure for production
     allow_credentials=True,
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
-# In-memory cache
+# In-memory cache with metadata
 cache = {}
 cache_lock = threading.Lock()
-CACHE_TTL = 3600  # 1 hour
+REFRESH_INTERVAL_MINUTES = 30  # Background refresh every 30 minutes
+
+# Supported geographies for background fetching
+DEFAULT_GEOS = ["IN", "US", "GB", "AU", "CA"]  # Add more as needed
+
+# Background scheduler
+scheduler = BackgroundScheduler()
+fetch_status = {
+    "last_fetch": None,
+    "next_fetch": None,
+    "status": "initializing",
+    "fetched_geos": []
+}
 
 # Categories mapping
 CATEGORIES = {
@@ -108,25 +132,231 @@ def get_cache_key(geo: str, category: Optional[str] = None):
     return f"{geo}_all"
 
 
+def get_cache_file(geo: str, category: Optional[str] = None):
+    """Get cache file path"""
+    cache_key = get_cache_key(geo, category)
+    return CACHE_DIR / f"{cache_key}.json"
+
+
+def load_from_disk(geo: str, category: Optional[str] = None):
+    """Load cached data from disk"""
+    cache_file = get_cache_file(geo, category)
+    if cache_file.exists():
+        try:
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                logger.info(f"Loaded from disk: {cache_file.name}")
+                return data
+        except Exception as e:
+            logger.error(f"Error loading cache from disk: {e}")
+    return None
+
+
+def save_to_disk(geo: str, data: dict, category: Optional[str] = None):
+    """Save data to disk"""
+    cache_file = get_cache_file(geo, category)
+    try:
+        with open(cache_file, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        logger.info(f"Saved to disk: {cache_file.name}")
+    except Exception as e:
+        logger.error(f"Error saving to disk: {e}")
+
+
 def get_from_cache(cache_key: str):
-    """Get data from cache if not expired"""
+    """Get data from in-memory cache (always fresh due to background updates)"""
     with cache_lock:
         if cache_key in cache:
-            data, timestamp = cache[cache_key]
-            if time.time() - timestamp < CACHE_TTL:
-                logger.info(f"Cache HIT: {cache_key}")
-                return data
-            else:
-                del cache[cache_key]
-                logger.info(f"Cache EXPIRED: {cache_key}")
+            data = cache[cache_key]
+            logger.info(f"Cache HIT: {cache_key}")
+            return data
     return None
 
 
 def set_cache(cache_key: str, data):
-    """Store data in cache"""
+    """Store data in in-memory cache"""
     with cache_lock:
-        cache[cache_key] = (data, time.time())
+        cache[cache_key] = data
         logger.info(f"Cache SET: {cache_key}")
+
+
+def fetch_all_trends_for_geo(geo: str, workers: int = 3):
+    """
+    Fetch all trends for a geography (used by background task)
+    """
+    logger.info(f"🔄 Background fetch started for {geo}")
+    start_time = time.time()
+    
+    all_trends = []
+    successful = 0
+    failed = 0
+    empty = 0
+    
+    def fetch_category(category_id: int, category_name: str):
+        """Fetch single category"""
+        url = f"https://trends.google.com/trending?geo={geo}&category={category_id}"
+        data = scrape_google_trends(url, category_name, category_id)
+        
+        if data:
+            return {"status": "success", "id": category_id, "name": category_name, "data": data}
+        else:
+            return {"status": "failed", "id": category_id, "name": category_name, "data": []}
+    
+    # Parallel scraping
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(fetch_category, cat_id, cat_name): cat_name
+            for cat_id, cat_name in CATEGORY_NAMES.items()
+        }
+        
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                
+                if result["status"] == "success":
+                    successful += 1
+                    # Add category to each trend
+                    for trend in result["data"]:
+                        all_trends.append({
+                            "category": result["name"],
+                            "category_id": result["id"],
+                            **trend
+                        })
+                else:
+                    if result["data"] == []:
+                        empty += 1
+                    else:
+                        failed += 1
+            except Exception as e:
+                logger.error(f"Error in future: {e}")
+                failed += 1
+    
+    execution_time = time.time() - start_time
+    
+    response = {
+        "geo": geo,
+        "total_categories": len(CATEGORY_NAMES),
+        "successful_categories": successful,
+        "failed_categories": failed,
+        "empty_categories": empty,
+        "total_trends": len(all_trends),
+        "trends": all_trends,
+        "timestamp": datetime.now().isoformat(),
+        "execution_time": round(execution_time, 2),
+        "cached": True,
+        "background_fetched": True
+    }
+    
+    # Store in cache
+    cache_key = get_cache_key(geo)
+    set_cache(cache_key, response)
+    
+    # Save to disk
+    save_to_disk(geo, response)
+    
+    logger.info(f"✅ Background fetch completed for {geo}: {len(all_trends)} trends in {execution_time:.2f}s")
+    return response
+
+
+def background_fetch_task():
+    """
+    Background task to fetch data for all configured geographies
+    """
+    logger.info("🚀 Starting background fetch task for all geographies")
+    fetch_status["status"] = "running"
+    fetch_status["last_fetch"] = datetime.now().isoformat()
+    fetch_status["fetched_geos"] = []  # Reset list
+    
+    for geo in DEFAULT_GEOS:
+        try:
+            fetch_all_trends_for_geo(geo, workers=3)
+            fetch_status["fetched_geos"].append({
+                "geo": geo,
+                "timestamp": datetime.now().isoformat(),
+                "status": "success"
+            })
+        except Exception as e:
+            logger.error(f"Error fetching {geo}: {e}")
+            fetch_status["fetched_geos"].append({
+                "geo": geo,
+                "timestamp": datetime.now().isoformat(),
+                "status": "error",
+                "error": str(e)
+            })
+    
+    fetch_status["status"] = "completed"
+    fetch_status["next_fetch"] = datetime.fromtimestamp(
+        time.time() + (REFRESH_INTERVAL_MINUTES * 60)
+    ).isoformat()
+    
+    logger.info(f"✅ Background fetch completed for all geographies")
+
+
+def load_initial_cache():
+    """
+    Load cached data from disk on startup
+    """
+    logger.info("📂 Loading cached data from disk...")
+    loaded_count = 0
+    
+    for cache_file in CACHE_DIR.glob("*.json"):
+        try:
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                # Extract geo from filename (e.g., "IN_all.json" -> "IN_all")
+                cache_key = cache_file.stem
+                with cache_lock:
+                    cache[cache_key] = data
+                loaded_count += 1
+                logger.info(f"  Loaded: {cache_file.name}")
+        except Exception as e:
+            logger.error(f"  Error loading {cache_file.name}: {e}")
+    
+    logger.info(f"✅ Loaded {loaded_count} cached datasets from disk")
+    return loaded_count
+
+
+@app.on_event("startup")
+async def startup_event():
+    """
+    Initialize background scheduler and load cache on startup
+    """
+    logger.info("🚀 Starting Google Trends API v2.0.0")
+    
+    # Load existing cache from disk
+    load_initial_cache()
+    
+    # Start background fetch immediately if cache is empty
+    if len(cache) == 0:
+        logger.info("📥 No cache found, starting initial fetch...")
+        threading.Thread(target=background_fetch_task, daemon=True).start()
+    
+    # Schedule periodic background fetches
+    scheduler.add_job(
+        background_fetch_task,
+        trigger=IntervalTrigger(minutes=REFRESH_INTERVAL_MINUTES),
+        id='fetch_trends',
+        name='Fetch Google Trends',
+        replace_existing=True
+    )
+    scheduler.start()
+    
+    fetch_status["status"] = "scheduled"
+    fetch_status["next_fetch"] = datetime.fromtimestamp(
+        time.time() + (REFRESH_INTERVAL_MINUTES * 60)
+    ).isoformat()
+    
+    logger.info(f"✅ Background scheduler started (refresh every {REFRESH_INTERVAL_MINUTES} minutes)")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """
+    Cleanup on shutdown
+    """
+    logger.info("🛑 Shutting down Google Trends API")
+    scheduler.shutdown()
+    logger.info("✅ Scheduler stopped")
 
 
 def scrape_google_trends(url: str, category_name: str, category_id: int, download_dir="temp_downloads") -> Optional[List[Dict]]:
@@ -270,19 +500,29 @@ async def root():
     """API root endpoint"""
     return {
         "name": "Google Trends API",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "status": "operational",
+        "features": [
+            "Background data fetching every 30 minutes",
+            "Instant API responses from cached data",
+            "Persistent storage across restarts",
+            "Auto-refresh mechanism"
+        ],
+        "supported_geos": DEFAULT_GEOS,
         "endpoints": {
-            "GET /api/v1/{geo}": "Get all trends for a geography",
+            "GET /api/v1/{geo}": "Get all trends for a geography (instant response)",
             "GET /api/v1/{geo}/{category}": "Get trends for specific category",
             "GET /categories": "List all available categories",
+            "GET /status": "Background fetch status",
+            "POST /refresh/{geo}": "Manually trigger refresh for a geography",
             "GET /health": "Health check",
             "GET /docs": "API documentation"
         },
         "examples": [
             "/api/v1/IN - All trends for India",
             "/api/v1/US/technology - Technology trends in USA",
-            "/api/v1/GB/sports - Sports trends in UK"
+            "/api/v1/GB/sports - Sports trends in UK",
+            "/status - Check background fetch status"
         ]
     }
 
@@ -294,7 +534,12 @@ async def health_check():
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
         "cache_size": len(cache),
-        "uptime": "operational"
+        "uptime": "operational",
+        "background_fetch": {
+            "status": fetch_status["status"],
+            "last_fetch": fetch_status["last_fetch"],
+            "next_fetch": fetch_status["next_fetch"]
+        }
     }
     
     # Check ChromeDriver availability
@@ -316,6 +561,20 @@ async def health_check():
         health_data["warning"] = "ChromeDriver not found - scraping will fail"
     
     return health_data
+
+
+@app.get("/status")
+async def fetch_status_endpoint():
+    """Get background fetch status"""
+    return {
+        "refresh_interval_minutes": REFRESH_INTERVAL_MINUTES,
+        "supported_geos": DEFAULT_GEOS,
+        "fetch_status": fetch_status,
+        "cache": {
+            "in_memory_count": len(cache),
+            "disk_files": len(list(CACHE_DIR.glob("*.json")))
+        }
+    }
 
 
 @app.get("/categories")
@@ -344,88 +603,62 @@ async def get_all_trends(
     
     Parameters:
     - geo: Country code (IN, US, GB, etc.)
-    - workers: Number of parallel workers (1-5, default: 3)
+    - workers: Number of parallel workers (only used if data not cached)
     
-    Returns flat array where each trend includes category field
+    Returns instant cached data if available, otherwise fetches live
     """
     geo = geo.upper()
-    workers = min(max(workers, 1), 5)  # Limit 1-5
     
-    # Check cache
+    # Check cache first (should always hit if background fetch is working)
     cache_key = get_cache_key(geo)
     cached_data = get_from_cache(cache_key)
     
     if cached_data:
-        cached_data["cached"] = True
+        logger.info(f"✅ Instant response from cache: {geo}")
         return JSONResponse(content=cached_data)
     
-    logger.info(f"Fetching all trends for {geo} with {workers} workers")
-    start_time = time.time()
+    # Fallback: check disk cache
+    disk_data = load_from_disk(geo)
+    if disk_data:
+        logger.info(f"✅ Response from disk cache: {geo}")
+        set_cache(cache_key, disk_data)
+        return JSONResponse(content=disk_data)
     
-    all_trends = []
-    successful = 0
-    failed = 0
-    empty = 0
+    # Last resort: fetch live (only happens if background fetch failed or first time)
+    logger.warning(f"⚠️ Cache miss for {geo}, fetching live data...")
+    workers = min(max(workers, 1), 5)  # Limit 1-5
     
-    def fetch_category(category_id: int, category_name: str):
-        """Fetch single category"""
-        url = f"https://trends.google.com/trending?geo={geo}&category={category_id}"
-        data = scrape_google_trends(url, category_name, category_id)
-        
-        if data:
-            return {"status": "success", "id": category_id, "name": category_name, "data": data}
-        else:
-            return {"status": "failed", "id": category_id, "name": category_name, "data": []}
-    
-    # Parallel scraping
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {
-            executor.submit(fetch_category, cat_id, cat_name): cat_name
-            for cat_id, cat_name in CATEGORY_NAMES.items()
-        }
-        
-        for future in as_completed(futures):
-            try:
-                result = future.result()
-                
-                if result["status"] == "success":
-                    successful += 1
-                    # Add category to each trend
-                    for trend in result["data"]:
-                        all_trends.append({
-                            "category": result["name"],
-                            "category_id": result["id"],
-                            **trend
-                        })
-                else:
-                    if result["data"] == []:
-                        empty += 1
-                    else:
-                        failed += 1
-            except Exception as e:
-                logger.error(f"Error in future: {e}")
-                failed += 1
-    
-    execution_time = time.time() - start_time
-    
-    response = {
-        "geo": geo,
-        "total_categories": len(CATEGORY_NAMES),
-        "successful_categories": successful,
-        "failed_categories": failed,
-        "empty_categories": empty,
-        "total_trends": len(all_trends),
-        "trends": all_trends,
-        "timestamp": datetime.now().isoformat(),
-        "execution_time": round(execution_time, 2),
-        "cached": False
-    }
-    
-    # Cache response
-    set_cache(cache_key, response)
-    
-    logger.info(f"Completed {geo}: {len(all_trends)} trends in {execution_time:.2f}s")
+    response = fetch_all_trends_for_geo(geo, workers)
     return JSONResponse(content=response)
+
+
+@app.post("/refresh/{geo}")
+async def manual_refresh(geo: str):
+    """
+    Manually trigger a refresh for specific geography
+    
+    Parameters:
+    - geo: Country code (IN, US, GB, etc.)
+    
+    Use this to force an immediate update instead of waiting for background task
+    """
+    geo = geo.upper()
+    logger.info(f"🔄 Manual refresh triggered for {geo}")
+    
+    # Run fetch in background thread to not block response
+    def fetch_and_notify():
+        try:
+            fetch_all_trends_for_geo(geo, workers=3)
+        except Exception as e:
+            logger.error(f"Error in manual refresh: {e}")
+    
+    threading.Thread(target=fetch_and_notify, daemon=True).start()
+    
+    return {
+        "message": f"Refresh started for {geo}",
+        "status": "processing",
+        "note": "Data will be updated in background. Check /status for progress."
+    }
 
 
 @app.get("/api/v1/{geo}/{category}")
@@ -437,7 +670,7 @@ async def get_category_trends(geo: str, category: str):
     - geo: Country code (IN, US, GB, etc.)
     - category: Category slug (business, technology, sports, etc.)
     
-    See /categories for all available categories
+    Filters from cached data if available for instant response
     """
     geo = geo.upper()
     category = category.lower()
@@ -452,17 +685,43 @@ async def get_category_trends(geo: str, category: str):
     category_id = CATEGORIES[category]
     category_name = CATEGORY_NAMES[category_id]
     
-    # Check cache
+    # Try to get from full cached data first (much faster)
+    cache_key_all = get_cache_key(geo)
+    cached_all_data = get_from_cache(cache_key_all)
+    
+    if cached_all_data and "trends" in cached_all_data:
+        # Filter trends by category from cached data
+        filtered_trends = [
+            trend for trend in cached_all_data["trends"]
+            if trend.get("category_id") == category_id
+        ]
+        
+        if filtered_trends:
+            logger.info(f"✅ Filtered {len(filtered_trends)} trends for {category} from cache")
+            response = {
+                "geo": geo,
+                "category": category_name,
+                "category_id": category_id,
+                "category_slug": category,
+                "total_trends": len(filtered_trends),
+                "trends": filtered_trends,
+                "timestamp": cached_all_data.get("timestamp", datetime.now().isoformat()),
+                "cached": True,
+                "filtered_from_cache": True
+            }
+            return JSONResponse(content=response)
+    
+    # Fallback: check if we have category-specific cache
     cache_key = get_cache_key(geo, category)
     cached_data = get_from_cache(cache_key)
     
     if cached_data:
-        cached_data["cached"] = True
+        logger.info(f"✅ Category-specific cache hit: {category}")
         return JSONResponse(content=cached_data)
     
-    logger.info(f"Fetching {category} trends for {geo}")
+    # Last resort: fetch live
+    logger.warning(f"⚠️ No cached data for {category} in {geo}, fetching live...")
     
-    # Scrape
     url = f"https://trends.google.com/trending?geo={geo}&category={category_id}"
     data = scrape_google_trends(url, category_name, category_id)
     
@@ -485,6 +744,7 @@ async def get_category_trends(geo: str, category: str):
     
     # Cache response
     set_cache(cache_key, response)
+    save_to_disk(geo, response, category)
     
     logger.info(f"Found {len(data)} trends for {category} in {geo}")
     return JSONResponse(content=response)

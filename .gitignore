@@ -45,6 +45,7 @@ api.log
 # Cache
 .cache/
 *.cache
+cache_data/
 
 # Temp files
 temp_downloads/
