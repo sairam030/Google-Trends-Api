@@ -25,7 +25,7 @@ class Settings:
     CACHE_DIR = os.getenv("CACHE_DIR", "cache_data")
     
     # Scraping Settings
-    MAX_WORKERS = int(os.getenv("MAX_WORKERS", 3))
+    MAX_WORKERS = int(os.getenv("MAX_WORKERS", 1))  # Sequential for stability
     DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT", 40))
     
     # CORS Settings

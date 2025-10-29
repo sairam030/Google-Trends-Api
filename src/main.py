@@ -180,9 +180,10 @@ def set_cache(cache_key: str, data):
         logger.info(f"Cache SET: {cache_key}")
 
 
-def fetch_all_trends_for_geo(geo: str, workers: int = 3):
+def fetch_all_trends_for_geo(geo: str, workers: int = 1):
     """
     Fetch all trends for a geography (used by background task)
+    Note: Sequential processing (workers=1) for maximum stability
     """
     logger.info(f"🔄 Background fetch started for {geo}")
     start_time = time.time()
@@ -192,44 +193,33 @@ def fetch_all_trends_for_geo(geo: str, workers: int = 3):
     failed = 0
     empty = 0
     
-    def fetch_category(category_id: int, category_name: str):
-        """Fetch single category"""
-        url = f"https://trends.google.com/trending?geo={geo}&category={category_id}"
-        data = scrape_google_trends(url, category_name, category_id)
-        
-        if data:
-            return {"status": "success", "id": category_id, "name": category_name, "data": data}
-        else:
-            return {"status": "failed", "id": category_id, "name": category_name, "data": []}
-    
-    # Parallel scraping
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {
-            executor.submit(fetch_category, cat_id, cat_name): cat_name
-            for cat_id, cat_name in CATEGORY_NAMES.items()
-        }
-        
-        for future in as_completed(futures):
-            try:
-                result = future.result()
-                
-                if result["status"] == "success":
-                    successful += 1
-                    # Add category to each trend
-                    for trend in result["data"]:
-                        all_trends.append({
-                            "category": result["name"],
-                            "category_id": result["id"],
-                            **trend
-                        })
-                else:
-                    if result["data"] == []:
-                        empty += 1
-                    else:
-                        failed += 1
-            except Exception as e:
-                logger.error(f"Error in future: {e}")
-                failed += 1
+    # Process categories sequentially to avoid Chrome crashes
+    for category_id, category_name in CATEGORY_NAMES.items():
+        try:
+            # Add delay between categories
+            if successful > 0 or failed > 0:
+                time.sleep(1)  # Cooldown between categories
+            
+            url = f"https://trends.google.com/trending?geo={geo}&category={category_id}"
+            logger.info(f"  Fetching: {category_name}")
+            data = scrape_google_trends(url, category_name, category_id)
+            
+            if data:
+                successful += 1
+                # Add category to each trend
+                for trend in data:
+                    all_trends.append({
+                        "category": category_name,
+                        "category_id": category_id,
+                        **trend
+                    })
+                logger.info(f"  ✓ {category_name}: {len(data)} trends")
+            else:
+                empty += 1
+                logger.info(f"  ○ {category_name}: No data")
+        except Exception as e:
+            failed += 1
+            logger.error(f"  ✗ {category_name}: {e}")
     
     execution_time = time.time() - start_time
     
@@ -269,12 +259,15 @@ def background_fetch_task():
     
     for geo in DEFAULT_GEOS:
         try:
-            fetch_all_trends_for_geo(geo, workers=3)
+            # Use 1 worker (sequential) for maximum stability
+            fetch_all_trends_for_geo(geo, workers=1)
             fetch_status["fetched_geos"].append({
                 "geo": geo,
                 "timestamp": datetime.now().isoformat(),
                 "status": "success"
             })
+            # Add delay between geographies
+            time.sleep(3)
         except Exception as e:
             logger.error(f"Error fetching {geo}: {e}")
             fetch_status["fetched_geos"].append({
@@ -626,9 +619,8 @@ async def get_all_trends(
     
     # Last resort: fetch live (only happens if background fetch failed or first time)
     logger.warning(f"⚠️ Cache miss for {geo}, fetching live data...")
-    workers = min(max(workers, 1), 5)  # Limit 1-5
     
-    response = fetch_all_trends_for_geo(geo, workers)
+    response = fetch_all_trends_for_geo(geo, workers=1)
     return JSONResponse(content=response)
 
 
@@ -648,7 +640,8 @@ async def manual_refresh(geo: str):
     # Run fetch in background thread to not block response
     def fetch_and_notify():
         try:
-            fetch_all_trends_for_geo(geo, workers=3)
+            # Use 1 worker (sequential) for stability
+            fetch_all_trends_for_geo(geo, workers=1)
         except Exception as e:
             logger.error(f"Error in manual refresh: {e}")
     
